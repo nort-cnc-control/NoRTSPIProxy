@@ -56,11 +56,9 @@ spidev is /dev/spidev* and '7' is a gpio number for interrupt from device
 #include <string.h>
 #include <gpiod.h>
 
-int sendline(int sock, const char *buf, size_t len);
+#define DEBUG 0
 
-int spi_speed = 1000000;
-int spi_bits  = 8;
-int spi_delay = 0;
+int sendline(int sock, const char *buf, size_t len);
 
 #define MAXLEN 120
 
@@ -72,9 +70,7 @@ int spi_transfer(int spidev, const uint8_t *tx, uint8_t *rx, size_t len)
         .tx_buf = (unsigned long)tx,
         .rx_buf = (unsigned long)rx,
         .len = len,
-        .delay_usecs = spi_delay,
-        .speed_hz = spi_speed,
-        .bits_per_word = spi_bits,
+        .speed_hz = 10000,
     };
 
     int ret = ioctl(spidev, SPI_IOC_MESSAGE(1), &tr);
@@ -87,12 +83,19 @@ int spi_read(int spidev, uint8_t *rx, int len)
         .tx_buf = (unsigned long)zero,
         .rx_buf = (unsigned long)rx,
         .len = len,
-        .delay_usecs = spi_delay,
-        .speed_hz = spi_speed,
-        .bits_per_word = spi_bits,
+        .speed_hz = 10000,
     };
 
     int ret = ioctl(spidev, SPI_IOC_MESSAGE(1), &tr);
+#if DEBUG
+    int i;
+    printf("SPI READ: ");
+    for (i = 0; i < len; i++)
+    {
+        printf("%x(%c) ", rx[i], rx[i]);
+    }
+    printf("\n");
+#endif
     return ret;
 }
 
@@ -105,6 +108,7 @@ uint8_t resp_buf[MAXLEN];
 int resp_pos;
 int resp_len;
 bool resp_frame = false;
+bool resp_len_rdy = false;
 uint8_t rx_buf[MAXLEN];
 uint8_t tx_buf[MAXLEN];
 
@@ -117,24 +121,31 @@ void handle_rx(const uint8_t *data, size_t len)
     int i;
     for (i = 0; i < len; i++)
     {
-        if (data[i] == 0xFF)
+        if (data[i] == 0xFF && resp_pos == 0)
         {
             resp_frame = true;
         }
-        else if (resp_frame)
+        
+	if (resp_frame)
         {
             resp_buf[resp_pos] = data[i];
             resp_pos++;
-            if (resp_pos == 2)
+            if (resp_pos == 3)
             {
-                resp_len = ((int)resp_buf[0]) << 8 | resp_buf[1];
+                resp_len = ((int)resp_buf[1]) << 8 | resp_buf[2];
+		resp_len_rdy = true;
             }
-            if (resp_pos == resp_len + 2)
+            if (resp_pos == resp_len + 3)
             {
-                sendline(clientctlsock, resp_buf + 2, resp_len);
+                const char *received = resp_buf + 3;
+#if DEBUG
+		printf("Received from SPI: %.*s\n", resp_len, received);
+#endif
+                sendline(clientctlsock, received, resp_len);
                 resp_pos = 0;
                 resp_len = 0;
                 resp_frame = false;
+		resp_len_rdy = false;
             }
         }
     }
@@ -154,7 +165,9 @@ void send_command_to_rt(int spidev, const char *buf, size_t len)
 
     memcpy(tx_buf + msglen, buf, len);
     msglen += len;
-    printf("Send to SPI\n");
+#if DEBUG
+    printf("Send to SPI: %.*s\n", len, buf);
+#endif
 
     spi_transfer(spidev, tx_buf, rx_buf, msglen);
     handle_rx(rx_buf, msglen);
@@ -164,11 +177,12 @@ void send_command_to_rt(int spidev, const char *buf, size_t len)
 
 void ask_new_message(int spidev)
 {
-    spi_read(spidev, rx_buf, 4);
-    handle_rx(rx_buf, 4);
-    if (resp_frame)
+    uint8_t len_buf[3];
+    spi_read(spidev, len_buf, 3);
+    handle_rx(len_buf, 3);
+    if (resp_len_rdy)
     {
-        size_t len = resp_len - (resp_pos - 2);
+        size_t len = resp_len - (resp_pos - 3);
         spi_read(spidev, rx_buf, len);
         handle_rx(rx_buf, len);
     }
@@ -193,11 +207,13 @@ void *gpio_poll_cycle(void *arg)
 {
     int spidev = *((int*)arg);
     ask_new_messages(spidev);
+    struct timespec timeSpec = { 0, 100000000UL };
     while (run)
     {
         if (!has_new_messages())
-            gpiod_line_event_wait(line, NULL);
-        ask_new_messages(spidev);
+            gpiod_line_event_wait(line, &timeSpec);
+	if (has_new_messages())
+            ask_new_messages(spidev);
     }
 
     return NULL;
@@ -270,6 +286,7 @@ int main(int argc, const char **argv)
     
     const char* spidev_name = "/dev/spidev0.0";
     int spidev;
+    int speed = 10000;
     int gpio = 7;
     
     if (argc > 2)
@@ -281,6 +298,11 @@ int main(int argc, const char **argv)
     // init spidev
     spidev = open(spidev_name, O_RDWR);
     if (spidev < 0)
+    {
+        return -1;
+    }
+
+    if (ioctl(spidev, SPI_IOC_WR_MAX_SPEED_HZ, &speed) < 0)
     {
         return -1;
     }
@@ -298,13 +320,18 @@ int main(int argc, const char **argv)
         gpiod_chip_close(chip);
         return-1;
     }
-    rv = gpiod_line_request_input(line, "foobar");
+
+    struct gpiod_line_request_config cfg = {
+        .consumer = "foobar",
+	.request_type = GPIOD_LINE_REQUEST_DIRECTION_INPUT,
+	.flags = GPIOD_LINE_REQUEST_FLAG_BIAS_PULL_UP,
+    };
+    rv = gpiod_line_request(line, &cfg, 0);
     if (rv)
     {
         gpiod_chip_close(chip);
         return -1;
     }
-    gpiod_line_request_falling_edge_events(line, "foobar");
 
     // run gpio check thread
     run = 1;
@@ -328,7 +355,9 @@ int main(int argc, const char **argv)
             {
                 break;
             }
+#if DEBUG
             printf("RECEIVE CTL: %.*s\n", len, buf);
+#endif
             if (!strncmp(buf, "EXIT:", 5))
             {
                 break;
