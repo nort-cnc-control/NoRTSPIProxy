@@ -56,7 +56,8 @@ spidev is /dev/spidev* and '7' is a gpio number for interrupt from device
 #include <string.h>
 #include <gpiod.h>
 
-#define DEBUG 0
+#define SPEED 6000
+#define DEBUG 1
 
 int sendline(int sock, const char *buf, size_t len);
 
@@ -64,16 +65,30 @@ int sendline(int sock, const char *buf, size_t len);
 
 uint8_t zero[MAXLEN];
 
+void print_buffer(const uint8_t *buf, size_t len)
+{
+    int i;
+    for (i = 0; i < len; i++)
+    {
+        printf("%x(%c) ", buf[i], buf[i]);
+    }
+    printf("\n");
+}
+
 int spi_transfer(int spidev, const uint8_t *tx, uint8_t *rx, size_t len)
 {
     struct spi_ioc_transfer tr = {
         .tx_buf = (unsigned long)tx,
         .rx_buf = (unsigned long)rx,
         .len = len,
-        .speed_hz = 10000,
+        .speed_hz = SPEED,
     };
 
     int ret = ioctl(spidev, SPI_IOC_MESSAGE(1), &tr);
+#if DEBUG >= 2
+    printf("SPI READ: ");
+    print_buffer(rx, len);
+#endif
     return ret;
 }
 
@@ -83,18 +98,13 @@ int spi_read(int spidev, uint8_t *rx, int len)
         .tx_buf = (unsigned long)zero,
         .rx_buf = (unsigned long)rx,
         .len = len,
-        .speed_hz = 10000,
+        .speed_hz = SPEED,
     };
 
     int ret = ioctl(spidev, SPI_IOC_MESSAGE(1), &tr);
-#if DEBUG
-    int i;
+#if DEBUG >= 2
     printf("SPI READ: ");
-    for (i = 0; i < len; i++)
-    {
-        printf("%x(%c) ", rx[i], rx[i]);
-    }
-    printf("\n");
+    print_buffer(rx, len);
 #endif
     return ret;
 }
@@ -134,6 +144,14 @@ void handle_rx(const uint8_t *data, size_t len)
             {
                 resp_len = ((int)resp_buf[1]) << 8 | resp_buf[2];
 		resp_len_rdy = true;
+                if (resp_len + 3 > MAXLEN)
+                {
+		    printf("Error receiving! Len=%i\n", resp_len);
+		    resp_len = 0;
+		    resp_len_rdy = false;
+		    resp_frame = false;
+		    resp_pos = 0;
+                }
             }
             if (resp_pos == resp_len + 3)
             {
@@ -156,6 +174,12 @@ pthread_mutex_t spi_mutex;
 void send_command_to_rt(int spidev, const char *buf, size_t len)
 {
     pthread_mutex_lock(&spi_mutex);
+
+    if (len + 3 > MAXLEN)
+    {
+        printf("Error transmitting! Len=%i\n", len);
+	return;
+    }
 
     size_t msglen = 0;
   
@@ -207,13 +231,22 @@ void *gpio_poll_cycle(void *arg)
 {
     int spidev = *((int*)arg);
     ask_new_messages(spidev);
-    struct timespec timeSpec = { 0, 100000000UL };
+    struct timespec timeSpec = { 1, 0L };
     while (run)
     {
         if (!has_new_messages())
+        {
+//            printf("wait\n");
             gpiod_line_event_wait(line, &timeSpec);
+            
+	    struct gpiod_line_event event;
+	    gpiod_line_event_read(line, &event);
+//	    printf("Event type = %i\n", event.event_type);
+        }
 	if (has_new_messages())
+        {
             ask_new_messages(spidev);
+        }
     }
 
     return NULL;
@@ -228,6 +261,7 @@ int readline(int sock, char *buf)
         int res = recv(sock, &c, 1, 0);
         if (res <= 0)
         {
+            printf("no data read\n");
             return -1;
         }
         if (c != '\n')
@@ -323,7 +357,7 @@ int main(int argc, const char **argv)
 
     struct gpiod_line_request_config cfg = {
         .consumer = "foobar",
-	.request_type = GPIOD_LINE_REQUEST_DIRECTION_INPUT,
+	.request_type = GPIOD_LINE_REQUEST_EVENT_FALLING_EDGE,
 	.flags = GPIOD_LINE_REQUEST_FLAG_BIAS_PULL_UP,
     };
     rv = gpiod_line_request(line, &cfg, 0);
